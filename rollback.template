@@ -1,0 +1,120 @@
+#!/bin/bash
+# ==============================================================================
+# Automated Rollback Script (React + Python/Uvicorn)
+# ==============================================================================
+
+# Variables injected by setup.sh
+PROJECT_NAME="{{PROJECT_NAME}}"
+VPS_USER="{{VPS_USER}}"
+DISCORD_WEBHOOK_URL="{{DISCORD_WEBHOOK_URL}}"
+BACKEND_SERVICE_NAME="{{BACKEND_SERVICE_NAME}}"
+
+if [ "$VPS_USER" = "root" ]; then
+    USER_HOME="/root"
+else
+    USER_HOME="/home/$VPS_USER"
+fi
+
+BASE_DIR="$USER_HOME/$PROJECT_NAME"
+RELEASES_DIR="$BASE_DIR/releases"
+PROD_LINK="$BASE_DIR/production"
+
+# Helper Function for Discord
+notify_discord() {
+    local message="$1"
+    local color="$2"
+    if [ -n "$DISCORD_WEBHOOK_URL" ]; then
+        curl -H "Content-Type: application/json" \
+             -d "{\"embeds\": [{\"title\": \"Rollback Event\", \"description\": \"$message\", \"color\": $color}]}" \
+             "$DISCORD_WEBHOOK_URL" > /dev/null 2>&1
+    fi
+}
+
+echo "================================================================="
+echo "  Rollback Manager - $PROJECT_NAME"
+echo "================================================================="
+
+# Get list of releases
+RELEASES=($(ls -1 "$RELEASES_DIR" | sort -r))
+NUM_RELEASES=${#RELEASES[@]}
+
+if [ "$NUM_RELEASES" -eq 0 ]; then
+    echo "No releases found to rollback to."
+    exit 1
+fi
+
+# Find current active release
+if [ -L "$PROD_LINK" ]; then
+    CURRENT_RELEASE_PATH=$(readlink "$PROD_LINK")
+    CURRENT_RELEASE=$(basename "$CURRENT_RELEASE_PATH")
+else
+    CURRENT_RELEASE="None"
+fi
+
+echo "Current Active Release: $CURRENT_RELEASE"
+echo "Available Releases:"
+
+# Display available options
+for i in "${!RELEASES[@]}"; do
+    if [ "${RELEASES[$i]}" == "$CURRENT_RELEASE" ]; then
+        echo "  $((i+1))) ${RELEASES[$i]} (ACTIVE)"
+    else
+        echo "  $((i+1))) ${RELEASES[$i]}"
+    fi
+done
+
+echo ""
+
+# Determine target release from argument, or default to the previous one
+TARGET_RELEASE=$1
+
+if [ -z "$TARGET_RELEASE" ]; then
+    # If no argument, try to find the one right before the "ACTIVE" one
+    # If the active one isn't found in the list, or is the last one, ask manually
+    PREVIOUS_INDEX=-1
+    for i in "${!RELEASES[@]}"; do
+        if [ "${RELEASES[$i]}" == "$CURRENT_RELEASE" ]; then
+            PREVIOUS_INDEX=$((i+1))
+            break
+        fi
+    done
+
+    if [ "$PREVIOUS_INDEX" -gt -1 ] && [ "$PREVIOUS_INDEX" -lt "$NUM_RELEASES" ]; then
+        TARGET_RELEASE="${RELEASES[$PREVIOUS_INDEX]}"
+        echo "Automatically selected previous release: $TARGET_RELEASE"
+    else
+        echo "Could not auto-determine the previous release."
+        read -p "Enter the Release ID to rollback to: " TARGET_RELEASE
+    fi
+fi
+
+# Verify chosen release exists
+TARGET_PATH="$RELEASES_DIR/$TARGET_RELEASE"
+
+if [ ! -d "$TARGET_PATH" ]; then
+    echo "Error: Release '$TARGET_RELEASE' does not exist."
+    exit 1
+fi
+
+if [ "$TARGET_RELEASE" == "$CURRENT_RELEASE" ]; then
+    echo "This release is already active."
+    exit 0
+fi
+
+# Execute Rollback
+echo -e "\nRolling back to: $TARGET_RELEASE"
+ln -sfn "$TARGET_PATH" "$PROD_LINK"
+
+echo "Restarting backend service: $BACKEND_SERVICE_NAME"
+if [ -x "$(command -v pm2)" ]; then
+    pm2 restart "$BACKEND_SERVICE_NAME" || true
+else
+    echo "Warning: PM2 is not installed or not in PATH."
+fi
+
+echo "================================================================="
+echo "✅ Rollback Complete!"
+echo "Production now points to '$TARGET_RELEASE'"
+echo "================================================================="
+
+notify_discord "🔄 **Rollback Executed**\nProject: $PROJECT_NAME\nRolled back to: **$TARGET_RELEASE**" 16753920

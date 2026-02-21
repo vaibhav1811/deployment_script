@@ -1,0 +1,179 @@
+#!/bin/bash
+# ==============================================================================
+# Automated Git Hook Deployment Engine (React + Python/Uvicorn)
+# ==============================================================================
+
+# Variables injected by setup.sh
+PROJECT_NAME="{{PROJECT_NAME}}"
+VPS_USER="{{VPS_USER}}"
+DISCORD_WEBHOOK_URL="{{DISCORD_WEBHOOK_URL}}"
+FRONTEND_DIR_NAME="{{FRONTEND_DIR_NAME}}"
+BACKEND_DIR_NAME="{{BACKEND_DIR_NAME}}"
+BACKEND_SERVICE_NAME="{{BACKEND_SERVICE_NAME}}"
+MAX_RELEASES="{{MAX_RELEASES}}"
+
+if [ "$VPS_USER" = "root" ]; then
+    USER_HOME="/root"
+else
+    USER_HOME="/home/$VPS_USER"
+fi
+
+BASE_DIR="$USER_HOME/$PROJECT_NAME"
+REPO_DIR="$BASE_DIR/repo.git"
+RELEASES_DIR="$BASE_DIR/releases"
+SECRETS_DIR="$BASE_DIR/secrets"
+LOGS_DIR="$BASE_DIR/logs"
+PROD_LINK="$BASE_DIR/production"
+
+TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+NEW_RELEASE_DIR="$RELEASES_DIR/$TIMESTAMP"
+DEPLOY_LOG="$LOGS_DIR/deploy_$TIMESTAMP.log"
+
+# --- Helper Functions ---
+
+# Function to send Discord notifications
+notify_discord() {
+    local message="$1"
+    local color="$2"
+    if [ -n "$DISCORD_WEBHOOK_URL" ]; then
+        curl -H "Content-Type: application/json" \
+             -d "{\"embeds\": [{\"title\": \"Deployment Update\", \"description\": \"$message\", \"color\": $color}]}" \
+             "$DISCORD_WEBHOOK_URL" > /dev/null 2>&1
+    fi
+}
+
+# The catch-all failure handler
+handle_failure() {
+    echo -e "\n[!] ❌ Deployment Failed at step: $CURRENT_STEP" | tee -a "$DEPLOY_LOG"
+    notify_discord "❌ **Deployment Failed**\nProject: $PROJECT_NAME\nFailed during: **$CURRENT_STEP**\nCheck logs on server: \`$DEPLOY_LOG\`" 16711680
+    
+    # Cleanup the broken release
+    if [ -d "$NEW_RELEASE_DIR" ]; then
+        echo "Cleaning up failed release directory: $NEW_RELEASE_DIR" | tee -a "$DEPLOY_LOG"
+        rm -rf "$NEW_RELEASE_DIR"
+    fi
+    
+    echo "Site remains unchanged. Exiting." | tee -a "$DEPLOY_LOG"
+    exit 1
+}
+
+# Trap any error (`set -e` triggers this)
+trap 'handle_failure' ERR
+set -e
+
+# ==============================================================================
+# 1. Initialization
+# ==============================================================================
+CURRENT_STEP="Initialization"
+exec > >(tee -a "$DEPLOY_LOG") 2>&1
+echo "================================================================="
+echo "Starting Deployment for $PROJECT_NAME"
+echo "Timestamp: $TIMESTAMP"
+echo "Release Dir: $NEW_RELEASE_DIR"
+echo "================================================================="
+
+notify_discord "🚀 **Deployment Started**\nProject: $PROJECT_NAME\nRelease ID: $TIMESTAMP" 3447003
+
+mkdir -p "$NEW_RELEASE_DIR"
+
+# ==============================================================================
+# 2. Extract Code
+# ==============================================================================
+CURRENT_STEP="Git Checkout"
+echo "Extracting code to $NEW_RELEASE_DIR..."
+git --work-tree="$NEW_RELEASE_DIR" --git-dir="$REPO_DIR" checkout -f main
+
+# ==============================================================================
+# 3. Inject Secrets
+# ==============================================================================
+CURRENT_STEP="Injecting Secrets"
+echo "Injecting environment variables..."
+if [ -f "$SECRETS_DIR/frontend/.env" ]; then
+    cp "$SECRETS_DIR/frontend/.env" "$NEW_RELEASE_DIR/$FRONTEND_DIR_NAME/.env"
+else
+    echo "Warning: No frontend .env found in secrets."
+fi
+
+if [ -f "$SECRETS_DIR/backend/.env" ]; then
+    cp "$SECRETS_DIR/backend/.env" "$NEW_RELEASE_DIR/$BACKEND_DIR_NAME/.env"
+else
+    echo "Warning: No backend .env found in secrets."
+fi
+
+# ==============================================================================
+# 4. Build Frontend (React)
+# ==============================================================================
+CURRENT_STEP="Building Frontend ($FRONTEND_DIR_NAME)"
+notify_discord "🔨 **Building Frontend...**" 16776960
+if [ -d "$NEW_RELEASE_DIR/$FRONTEND_DIR_NAME" ]; then
+    echo "Entering Frontend Directory..."
+    cd "$NEW_RELEASE_DIR/$FRONTEND_DIR_NAME"
+    npm ci || npm install
+    npm run build
+else
+    echo "Frontend directory '$FRONTEND_DIR_NAME' not found in repo. Skipping frontend build."
+fi
+
+# ==============================================================================
+# 5. Build Backend (Python / Uvicorn)
+# ==============================================================================
+CURRENT_STEP="Building Backend ($BACKEND_DIR_NAME)"
+notify_discord "🔨 **Building Backend...**" 16776960
+if [ -d "$NEW_RELEASE_DIR/$BACKEND_DIR_NAME" ]; then
+    echo "Entering Backend Directory..."
+    cd "$NEW_RELEASE_DIR/$BACKEND_DIR_NAME"
+    
+    echo "Creating Virtual Environment..."
+    python3 -m venv venv
+    
+    echo "Installing Requirements..."
+    ./venv/bin/pip install --upgrade pip
+    ./venv/bin/pip install -r requirements.txt
+else
+    echo "Backend directory '$BACKEND_DIR_NAME' not found in repo. Skipping backend build."
+fi
+
+# ==============================================================================
+# 6. Activation (Symlink Swap)
+# ==============================================================================
+CURRENT_STEP="Activating Release"
+echo "Linking $NEW_RELEASE_DIR to $PROD_LINK..."
+ln -sfn "$NEW_RELEASE_DIR" "$PROD_LINK"
+
+# ==============================================================================
+# 7. Service Restart
+# ==============================================================================
+CURRENT_STEP="Restarting Services"
+notify_discord "🔄 **Restarting Services...**" 16776960
+
+if [ -x "$(command -v pm2)" ]; then
+    echo "Restarting PM2 backend service: $BACKEND_SERVICE_NAME"
+    
+    # We restart the backend with PM2 using the updated symlink path
+    # If it's the first time, it might fail to restart, but `setup.sh` instructs user to pre-configure it
+    pm2 restart "$BACKEND_SERVICE_NAME" --update-env || true
+else
+    echo "Warning: PM2 is not installed or not in PATH."
+fi
+
+# Note: Nginx doesn't need restarting just for new static files, it serves whatever PROD_LINK points to automatically.
+
+# ==============================================================================
+# 8. Cleanup Old Releases
+# ==============================================================================
+CURRENT_STEP="Cleanup Old Releases"
+echo "Keeping only the latest $MAX_RELEASES releases..."
+cd "$RELEASES_DIR"
+# List dirs by time, keep top 'N', delete the rest
+ls -1tr | head -n -"$MAX_RELEASES" | xargs -d '\n' rm -rf -- || true
+
+# ==============================================================================
+# 9. Success
+# ==============================================================================
+CURRENT_STEP="Done"
+echo "================================================================="
+echo "✅ Deployment Successful!"
+echo "================================================================="
+
+notify_discord "✅ **Deployment Successful**\nProject: $PROJECT_NAME\nLive Release: $TIMESTAMP" 65280
+exit 0
